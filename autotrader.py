@@ -17,10 +17,12 @@
 #     <https://www.gnu.org/licenses/>.
 import asyncio
 import itertools
+import math
 
 from typing import List
 
 from ready_trader_go import BaseAutoTrader, Instrument, Lifespan, MAXIMUM_ASK, MINIMUM_BID, Side
+import scipy
 
 
 LOT_SIZE = 10
@@ -46,6 +48,15 @@ class AutoTrader(BaseAutoTrader):
         self.asks = set()
         self.ask_id = self.ask_price = self.bid_id = self.bid_price = self.position = 0
 
+        self.movingAverage = 0
+        self.movingSD = 0
+        self.currentETF = 0
+        self.currentFutures = 0
+        self.currentRatio = 0
+        self.rollingPrices = list()
+        self.tick = 0
+        self.n = 50
+
     def on_error_message(self, client_order_id: int, error_message: bytes) -> None:
         """Called when the exchange detects an error.
 
@@ -68,6 +79,18 @@ class AutoTrader(BaseAutoTrader):
         self.logger.info("received hedge filled for order %d with average price %d and volume %d", client_order_id,
                          price, volume)
 
+    def calculate_rolling_average_50(self):
+        sum = 0
+        for i in range(self.tick - self.n, self.tick-1):
+            sum += self.rollingPrices[i]
+        return sum / self.n
+
+    def calc_rolling_sd_50(self):
+        sum = 0
+        for i in range(self.tick - self.n, self.tick-1):
+            sum += pow(self.rollingPrices[i] - self.movingAverage,2)
+        return math.sqrt(sum / (self.n-1))
+
     def on_order_book_update_message(self, instrument: int, sequence_number: int, ask_prices: List[int],
                                      ask_volumes: List[int], bid_prices: List[int], bid_volumes: List[int]) -> None:
         """Called periodically to report the status of an order book.
@@ -79,6 +102,57 @@ class AutoTrader(BaseAutoTrader):
         """
         self.logger.info("received order book for instrument %d with sequence number %d", instrument,
                          sequence_number)
+
+        #Calculate the ratio rn
+        if instrument == Instrument.ETF:
+            self.currentETF = (bid_prices[0] + ask_prices[0]) / 2
+            if self.currentFutures == 0:
+                return
+        if instrument == Instrument.FUTURE:
+            self.currentFutures = (bid_prices[0] + ask_prices[0]) / 2
+            if self.currentETF == 0:
+                return
+        self.currentRatio = self.currentETF / self.currentFutures
+        self.rollingPrices.append(self.currentRatio)
+        if self.tick >= self.n:
+            self.movingAverage = self.calculate_rolling_average_50()
+            self.movingSD = self.calc_rolling_sd_50()
+            Z = (self.currentRatio - self.movingAverage)/self.movingSD
+            price_adjustment = - (self.position // LOT_SIZE) * TICK_SIZE_IN_CENTS
+            new_bid_price = bid_prices[0] if bid_prices[0] != 0 else 0
+            new_ask_price = ask_prices[0] if ask_prices[0] != 0 else 0
+            if self.bid_id != 0 and new_bid_price not in (self.bid_price, 0):
+                self.send_cancel_order(self.bid_id)
+                self.bid_id = 0
+                return
+            if self.ask_id != 0 and new_ask_price not in (self.ask_price, 0):
+                self.send_cancel_order(self.ask_id)
+                self.ask_id = 0
+                return
+
+            #Now we make our positions
+            if Z > 1.1: #We want to sell ETF as long as we stay within position, do this by making a new best price.
+                if self.ask_id == 0 and new_ask_price != 0 and self.position - LOT_SIZE> -POSITION_LIMIT:
+                    self.ask_id = next(self.order_ids)
+                    self.ask_price = new_ask_price
+                    self.send_insert_order(self.ask_id, Side.SELL, new_ask_price, LOT_SIZE, Lifespan.FILL_AND_KILL)
+                    self.asks.add(self.ask_id)
+            elif Z < 0.9: #We want to buy ETF
+                if self.bid_id == 0 and new_bid_price != 0 and self.position + LOT_SIZE < POSITION_LIMIT:
+                    self.bid_id = next(self.order_ids)
+                    self.bid_price = new_bid_price
+                    self.send_insert_order(self.bid_id, Side.BUY, new_bid_price, LOT_SIZE, Lifespan.FILL_AND_KILL)
+                    self.bids.add(self.bid_id)
+            else: #We want to stop all actions and cancel any existing orders
+                if self.bid_id != 0:
+                    self.send_cancel_order(self.bid_id)
+                    self.bid_id = 0
+                if self.ask_id != 0:
+                    self.send_cancel_order(self.ask_id)
+                    self.bid_id = 0
+        self.tick += 1
+
+        """
         if instrument == Instrument.FUTURE:
             price_adjustment = - (self.position // LOT_SIZE) * TICK_SIZE_IN_CENTS
             new_bid_price = bid_prices[0] + price_adjustment if bid_prices[0] != 0 else 0
@@ -102,6 +176,7 @@ class AutoTrader(BaseAutoTrader):
                 self.ask_price = new_ask_price
                 self.send_insert_order(self.ask_id, Side.SELL, new_ask_price, LOT_SIZE, Lifespan.GOOD_FOR_DAY)
                 self.asks.add(self.ask_id)
+                """
 
     def on_order_filled_message(self, client_order_id: int, price: int, volume: int) -> None:
         """Called when when of your orders is filled, partially or fully.
